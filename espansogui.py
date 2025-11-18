@@ -12,7 +12,7 @@ import yaml
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import webview
 
@@ -64,6 +64,7 @@ class EspansoAPI:
         self._yaml_errors: List[Dict[str, Any]] = []
         self._connection_steps: List[Dict[str, Any]] = []
         self._watcher: Optional[FileWatcher] = None
+        self._connection_thread: Optional[threading.Thread] = None
         self._ready = False  # Track initialization completion
         self._preferences = self._load_preferences()
         self._snippetsense_settings = self._preferences.get("snippetsense", self._default_snippetsense_settings())
@@ -84,8 +85,6 @@ class EspansoAPI:
         self._initialize_paths(self._config_override)
         if self._snippetsense_settings.get("enabled"):
             self._start_snippetsense_engine()
-        self._ready = True
-        print(f"[INFO] EspansoGUI ready with {len(self._match_cache)} snippets", flush=True)
         atexit.register(self.shutdown)
 
     def shutdown(self) -> None:
@@ -426,6 +425,35 @@ matches:
             else:
                 shutil.copy2(item, target)
 
+    def _sync_override_to_default_paths(self) -> None:
+        """Mirror an override workspace back to the default Espanso paths."""
+        override = self._config_override
+        if not override:
+            return
+        if not self._paths:
+            return
+        try:
+            default_paths = self.loader.discover_paths(None)
+        except Exception as exc:
+            print(f"[WARNING] Unable to determine default Espanso paths: {exc}", flush=True)
+            return
+
+        if (
+            self._paths.config == default_paths.config
+            and self._paths.match == default_paths.match
+        ):
+            return
+
+        try:
+            self._copy_directory_contents(self._paths.config, default_paths.config)
+            self._copy_directory_contents(self._paths.match, default_paths.match)
+            print(
+                "[INFO] Synced override workspace into default Espanso paths",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[WARNING] Failed to mirror override workspace: {exc}", flush=True)
+
     def _populate_matches(self) -> None:
         """Load and parse all match files with error tracking."""
         matches: List[Dict[str, Any]] = []
@@ -491,6 +519,7 @@ matches:
             return list(self._events)
 
     def _run_connection_sequence(self) -> None:
+        self._ready = False
         self._connection_steps = []
         steps: List[Tuple[str, Callable[[], Tuple[str, str]]]] = [
             ("Ensure Espanso CLI", self._ensure_espanso_installed),
@@ -502,6 +531,15 @@ matches:
         ]
         for label, action in steps:
             self._record_step(label, action)
+        self._ready = True
+        print(f"[INFO] EspansoGUI ready with {len(self._match_cache)} snippets", flush=True)
+
+    def _schedule_connection_sequence(self) -> None:
+        if self._connection_thread and self._connection_thread.is_alive():
+            return
+        thread = threading.Thread(target=self._run_connection_sequence, daemon=True, name="Espanso Connection Sequence")
+        self._connection_thread = thread
+        thread.start()
 
     def _record_step(self, label: str, action: Callable[[], Tuple[str, str]]) -> None:
         try:
@@ -631,7 +669,7 @@ matches:
             self._populate_matches()
 
         status = self.cli.status()
-        self._run_connection_sequence()
+        self._schedule_connection_sequence()
 
         # Use cached data with fallbacks
         matches = self._match_cache if self._match_cache else []
@@ -1452,6 +1490,8 @@ matches:
 
     def refresh_files(self) -> Dict[str, Any]:
         self._populate_matches()
+        self._sync_override_to_default_paths()
+        self._schedule_connection_sequence()
         return self.get_dashboard()
 
     def get_base_yaml(self) -> Dict[str, Any]:
@@ -1874,36 +1914,52 @@ matches:
         return items
 
 
-def _start_webview(window: Any, platform_info: PlatformInfo, script_path: Path) -> None:
-    last_error: Optional[Exception] = None
-    if platform_info.is_wsl:
-        if _launch_windows_host_app(script_path):
-            print("[INFO] Detected WSL. Launched EspansoGUI via Windows host process.", flush=True)
-            return
-        message = (
-            "[ERROR] PyWebView cannot run inside WSL because no GUI subsystem is available, "
-            "and launching the Windows host process failed. Install WSLg or run this script directly on Windows."
-        )
-        print(message, flush=True)
-        raise webview.errors.WebViewException(message)  # type: ignore[attr-defined]
+def _prepare_gui_environment(script_path: Path) -> bool:
+    """Handle the WSL host handoff before starting the GUI backend."""
+    if not PLATFORM.is_wsl:
+        return True
+    if _launch_windows_host_app(script_path):
+        print("[INFO] Detected WSL. Launched EspansoGUI via Windows host process.", flush=True)
+        return False
+    message = (
+        "[ERROR] PyWebView cannot run inside WSL because no GUI subsystem is available, "
+        "and launching the Windows host process failed. Install WSLg or run this script directly on Windows."
+    )
+    print(message, flush=True)
+    raise webview.errors.WebViewException(message)  # type: ignore[attr-defined]
 
-    for preferred in platform_info.gui_preferences():
+
+def _start_webview(window: Any, platform_info: PlatformInfo) -> bool:
+    last_error: Optional[Exception] = None
+    backend_attempts: List[Optional[str]] = []
+    if platform_info.is_windows:
+        backend_attempts.append("winforms")
+    backend_attempts.extend(platform_info.gui_preferences())
+    # remove duplicates while preserving order
+    seen_backends: Set[Optional[str]] = set()
+    ordered_backends: List[Optional[str]] = []
+    for backend in backend_attempts:
+        if backend in seen_backends:
+            continue
+        seen_backends.add(backend)
+        ordered_backends.append(backend)
+
+    for preferred in ordered_backends:
         try:
             webview.start(gui=preferred, debug=True, http_server=False)
-            return
+            return True
         except webview.errors.WebViewException as exc:  # type: ignore[attr-defined]
             last_error = exc
             label = preferred or "auto"
             print(f"[WARNING] GUI backend '{label}' failed: {exc}", flush=True)
-            continue
     print(
         "[ERROR] PyWebView could not initialize a GUI backend. "
         f"{platform_info.gui_dependency_hint()}",
         flush=True,
     )
     if last_error:
-        raise last_error
-    raise webview.errors.WebViewException("No GUI backend available")  # type: ignore[attr-defined]
+        print(f"[DEBUG] Last GUI error: {last_error}", flush=True)
+    return False
 
 
 def _launch_windows_host_app(script_path: Path) -> bool:
@@ -1945,9 +2001,11 @@ def _wsl_to_windows_path(path: Path) -> Optional[str]:
 
 
 def main() -> None:
+    script_path = Path(__file__).resolve()
+    if not _prepare_gui_environment(script_path):
+        return
     api = EspansoAPI()
     html_path = Path(__file__).with_name("webview_ui") / "espanso_companion.html"
-    script_path = Path(__file__).resolve()
     window = webview.create_window(
         "EspansoGUI",
         html=html_path.read_text(encoding="utf-8"),
@@ -1956,38 +2014,9 @@ def main() -> None:
         height=900,
         min_size=(1000, 700),
     )
-    _start_webview(window, api.platform, script_path)
+    if not _start_webview(window, api.platform):
+        raise webview.errors.WebViewException("No GUI backend available")  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":
     main()
-
-"""
-CHANGELOG
-2025-02-14 Codex
-- Added snippet validation, timezone-aware backups, and fixed global variable harvesting for the Snippet IDE.
-- Enriched variable metadata so the frontend can render descriptive toolkit cards.
-2025-11-14 Codex
-- Added config override persistence, CLI-aware reinitialization, and config tree APIs plus watcher restarts for path explorer support.
-2025-11-15 Codex
-- CRITICAL FIX: Restored user's base.yml from backup after data loss
-- PERFORMANCE FIX: Changed get_dashboard() to only populate cache once instead of on every call
-- Added _ready flag to track initialization state
-- Added _ensure_base_yaml() to create default template only when file is missing (never overwrites)
-- Added informative logging throughout initialization and error paths
-- Improved defensive checks in get_dashboard() and list_snippets()
-2025-11-14 Codex
-- Implemented Phase 5 snippet metadata CRUD (label, enable/disable, backend, delay, boundaries, uppercase, image) plus the server-side search API with filters.
-2025-11-17 Codex
-- Added Quick Insert backend helpers: image previews, shell command tester, and date offset preview APIs.
-- Extended form snippet creation to support radio/select/checkbox inputs with validation.
-2025-11-17 Codex
-- Normalized global variable serialization to always emit Espanso's `type` field and drop incomplete entries.
-2025-11-17 Codex
-- Implemented pywebview GUI fallback logic so the app auto-detects supported backends and prints runtime installation tips when unavailable.
-2025-11-17 Codex
-- Added backend ping endpoint plus espanso match exec parsing so the dashboard bootstrap and match testing flows are reliable.
-- Preserved Windows CRLF replacements when saving snippets to prevent truncated multi-line output.
-2025-11-17 Codex
-- Changed service health check to inspect `espanso status` before issuing redundant `start` commands so the daemon logs remain quiet while connected.
-"""
