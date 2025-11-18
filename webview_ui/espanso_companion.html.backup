@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Espanso IDE</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            height: 100vh;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 200px;
+            background: #161b22;
+            border-right: 1px solid #30363d;
+            display: flex;
+            flex-direction: column;
+            padding: 20px 10px;
+        }
+        .sidebar h1 {
+            font-size: 18px;
+            margin-bottom: 20px;
+            padding: 0 10px;
+        }
+        .nav-btn {
+            padding: 12px 15px;
+            background: transparent;
+            border: none;
+            color: #c9d1d9;
+            text-align: left;
+            cursor: pointer;
+            border-radius: 6px;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        .nav-btn:hover { background: #21262d; }
+        .nav-btn.active { background: #1f6feb; color: #fff; }
+
+        /* Main Content */
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Views */
+        .view {
+            display: none;
+            flex-direction: column;
+            height: 100%;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        .view.active { display: flex; }
+
+        /* Status Bar */
+        .status-bar {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-indicator.connected { background: #3fb950; }
+        .status-indicator.disconnected { background: #f85149; }
+
+        /* Dashboard */
+        .dash-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .dash-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 20px;
+        }
+        .dash-card h3 {
+            font-size: 14px;
+            color: #8b949e;
+            margin-bottom: 10px;
+        }
+        .dash-card .value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+        .btn {
+            background: #238636;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 8px;
+            margin-bottom: 8px;
+        }
+        .btn:hover { background: #2ea043; }
+        .btn.danger { background: #da3633; }
+        .btn.danger:hover { background: #f85149; }
+
+        /* Editor */
+        #yaml-editor {
+            flex: 1;
+            width: 100%;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            resize: none;
+        }
+        .editor-toolbar {
+            margin-bottom: 10px;
+            display: flex;
+            gap: 10px;
+        }
+
+        /* Snippets */
+        .snippets-grid {
+            display: grid;
+            gap: 10px;
+        }
+        .snippet-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+        }
+        .snippet-trigger {
+            font-weight: 600;
+            color: #58a6ff;
+            margin-bottom: 5px;
+        }
+        .snippet-replace {
+            color: #8b949e;
+            font-size: 13px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #238636;
+            color: #fff;
+            padding: 12px 20px;
+            border-radius: 6px;
+            display: none;
+            z-index: 1000;
+        }
+        .toast.show { display: block; }
+        .toast.error { background: #da3633; }
+    </style>
+</head>
+<body>
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <h1>Espanso IDE</h1>
+        <button class="nav-btn active" data-view="dashboard">Dashboard</button>
+        <button class="nav-btn" data-view="editor">YAML Editor</button>
+        <button class="nav-btn" data-view="snippets">Snippets</button>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main">
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div>
+                <span class="status-indicator" id="connection-indicator"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+            <div id="snippet-count">0 snippets</div>
+        </div>
+
+        <!-- Dashboard View -->
+        <div class="view active" id="dashboard-view">
+            <h2 style="margin-bottom: 20px;">Espanso Control Panel</h2>
+
+            <div class="dash-grid">
+                <div class="dash-card">
+                    <h3>Service Status</h3>
+                    <div class="value" id="service-status">Unknown</div>
+                </div>
+                <div class="dash-card">
+                    <h3>Snippets</h3>
+                    <div class="value" id="total-snippets">0</div>
+                </div>
+                <div class="dash-card">
+                    <h3>Config Path</h3>
+                    <div class="value" id="config-path" style="font-size: 12px; word-break: break-all;">-</div>
+                </div>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <h3 style="margin-bottom: 10px;">Service Controls</h3>
+                <button class="btn" id="btn-start">Start Espanso</button>
+                <button class="btn" id="btn-stop">Stop Espanso</button>
+                <button class="btn" id="btn-restart">Restart Espanso</button>
+                <button class="btn" id="btn-refresh">Refresh Data</button>
+            </div>
+
+            <div style="margin-top: 20px;">
+                <h3 style="margin-bottom: 10px;">Connection Steps</h3>
+                <div id="connection-steps" style="font-size: 13px; color: #8b949e;"></div>
+            </div>
+        </div>
+
+        <!-- Editor View -->
+        <div class="view" id="editor-view">
+            <h2 style="margin-bottom: 15px;">base.yaml Editor</h2>
+            <div class="editor-toolbar">
+                <button class="btn" id="btn-save-yaml">Save & Reload</button>
+                <button class="btn" id="btn-reload-yaml">Reload from Disk</button>
+                <span id="editor-status" style="margin-left: 15px; color: #8b949e;"></span>
+            </div>
+            <textarea id="yaml-editor" placeholder="Loading base.yaml..."></textarea>
+        </div>
+
+        <!-- Snippets View -->
+        <div class="view" id="snippets-view">
+            <h2 style="margin-bottom: 15px;">Snippet Library</h2>
+            <input type="text" id="search-snippets" placeholder="Search snippets..." style="width: 100%; padding: 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; margin-bottom: 15px;">
+            <div class="snippets-grid" id="snippets-list"></div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <script>
+        let currentView = 'dashboard';
+
+        // Navigation
+        document.querySelectorAll('.nav-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const view = btn.dataset.view;
+                switchView(view);
+            });
+        });
+
+        function switchView(view) {
+            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+
+            document.querySelector(`[data-view="${view}"]`).classList.add('active');
+            document.getElementById(`${view}-view`).classList.add('active');
+
+            currentView = view;
+
+            // Load data when switching views
+            if (view === 'editor') loadEditor();
+            if (view === 'snippets') loadSnippets();
+        }
+
+        // Toast notifications
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.toggle('error', isError);
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+
+        // Check if running in pywebview
+        function isWebview() {
+            return window.pywebview && window.pywebview.api;
+        }
+
+        // Dashboard
+        async function loadDashboard() {
+            if (!isWebview()) {
+                document.getElementById('status-text').textContent = 'Offline (not in pywebview)';
+                return;
+            }
+
+            try {
+                const dashboard = await window.pywebview.api.get_dashboard();
+
+                // Update status
+                const connected = dashboard.statusMessage === 'Connected';
+                document.getElementById('connection-indicator').className =
+                    'status-indicator ' + (connected ? 'connected' : 'disconnected');
+                document.getElementById('status-text').textContent = dashboard.statusMessage;
+                document.getElementById('snippet-count').textContent = `${dashboard.snippetCount} snippets`;
+
+                // Update dashboard cards
+                document.getElementById('service-status').textContent = dashboard.cliStatus;
+                document.getElementById('total-snippets').textContent = dashboard.snippetCount;
+                document.getElementById('config-path').textContent = dashboard.configPath;
+
+                // Update connection steps
+                if (dashboard.connectionSteps) {
+                    const html = dashboard.connectionSteps.map(step => {
+                        const icon = step.status === 'success' ? '✓' : '⚠';
+                        return `<div style="margin: 5px 0;">${icon} ${step.label}: ${step.detail}</div>`;
+                    }).join('');
+                    document.getElementById('connection-steps').innerHTML = html;
+                }
+            } catch (err) {
+                showToast('Failed to load dashboard: ' + err.message, true);
+            }
+        }
+
+        // Service Controls
+        document.getElementById('btn-start').addEventListener('click', async () => {
+            if (!isWebview()) return;
+            try {
+                const result = await window.pywebview.api.start_service();
+                showToast(result.detail);
+                setTimeout(loadDashboard, 500);
+            } catch (err) {
+                showToast('Failed: ' + err.message, true);
+            }
+        });
+
+        document.getElementById('btn-stop').addEventListener('click', async () => {
+            if (!isWebview()) return;
+            try {
+                const result = await window.pywebview.api.stop_service();
+                showToast(result.detail);
+                setTimeout(loadDashboard, 500);
+            } catch (err) {
+                showToast('Failed: ' + err.message, true);
+            }
+        });
+
+        document.getElementById('btn-restart').addEventListener('click', async () => {
+            if (!isWebview()) return;
+            try {
+                const result = await window.pywebview.api.restart_service();
+                showToast(result.detail);
+                setTimeout(loadDashboard, 500);
+            } catch (err) {
+                showToast('Failed: ' + err.message, true);
+            }
+        });
+
+        document.getElementById('btn-refresh').addEventListener('click', async () => {
+            await loadDashboard();
+            showToast('Refreshed');
+        });
+
+        // Editor
+        async function loadEditor() {
+            if (!isWebview()) {
+                document.getElementById('yaml-editor').value = '# Not connected to pywebview';
+                return;
+            }
+
+            try {
+                document.getElementById('editor-status').textContent = 'Loading...';
+                const result = await window.pywebview.api.get_base_yaml();
+
+                if (result.status === 'success') {
+                    document.getElementById('yaml-editor').value = result.content;
+                    document.getElementById('editor-status').textContent = `Loaded: ${result.path}`;
+                } else {
+                    document.getElementById('yaml-editor').value = `# Error: ${result.detail}`;
+                    showToast(result.detail, true);
+                }
+            } catch (err) {
+                showToast('Failed to load YAML: ' + err.message, true);
+            }
+        }
+
+        document.getElementById('btn-save-yaml').addEventListener('click', async () => {
+            if (!isWebview()) return;
+
+            try {
+                const content = document.getElementById('yaml-editor').value;
+                document.getElementById('editor-status').textContent = 'Saving...';
+
+                const result = await window.pywebview.api.save_base_yaml(content);
+
+                if (result.status === 'success') {
+                    showToast(result.detail);
+                    document.getElementById('editor-status').textContent = 'Saved successfully';
+                    setTimeout(loadDashboard, 500); // Refresh dashboard
+                } else {
+                    showToast(result.detail, true);
+                    document.getElementById('editor-status').textContent = 'Save failed';
+                }
+            } catch (err) {
+                showToast('Failed to save: ' + err.message, true);
+            }
+        });
+
+        document.getElementById('btn-reload-yaml').addEventListener('click', loadEditor);
+
+        // Snippets
+        async function loadSnippets(searchQuery = '') {
+            if (!isWebview()) {
+                document.getElementById('snippets-list').innerHTML = '<p style="color: #8b949e;">Not connected</p>';
+                return;
+            }
+
+            try {
+                const snippets = await window.pywebview.api.list_snippets();
+
+                let filtered = snippets;
+                if (searchQuery) {
+                    const query = searchQuery.toLowerCase();
+                    filtered = snippets.filter(s =>
+                        s.trigger.toLowerCase().includes(query) ||
+                        s.replace.toLowerCase().includes(query)
+                    );
+                }
+
+                const html = filtered.map(snippet => `
+                    <div class="snippet-card">
+                        <div class="snippet-trigger">${snippet.trigger || '(no trigger)'}</div>
+                        <div class="snippet-replace">${snippet.replace || '(no replacement)'}</div>
+                        <div style="font-size: 11px; color: #6e7681; margin-top: 8px;">
+                            File: ${snippet.file}
+                            ${snippet.hasVars ? ' • Has variables' : ''}
+                        </div>
+                    </div>
+                `).join('');
+
+                document.getElementById('snippets-list').innerHTML = html || '<p style="color: #8b949e;">No snippets found</p>';
+            } catch (err) {
+                showToast('Failed to load snippets: ' + err.message, true);
+            }
+        }
+
+        document.getElementById('search-snippets').addEventListener('input', (e) => {
+            loadSnippets(e.target.value);
+        });
+
+        // Bootstrap
+        async function bootstrap() {
+            await loadDashboard();
+            showToast('Connected');
+            setInterval(loadDashboard, 5000); // Auto-refresh every 5s
+        }
+
+        // Initialize
+        document.addEventListener('pywebviewready', bootstrap);
+        if (window.pywebview?.api) {
+            bootstrap();
+        }
+
+        window.addEventListener('load', () => {
+            if (!window.pywebview) {
+                document.getElementById('status-text').textContent = 'Preview mode (no pywebview)';
+            }
+        });
+    </script>
+</body>
+</html>
