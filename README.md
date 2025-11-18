@@ -11,19 +11,35 @@ EspansoGUI discovers the active Espanso workspace, monitors the daemon, and expo
 ---
 
 ## Table of Contents
-1. [Overview](#overview)
-2. [Getting Started](#getting-started)
-   - [Requirements](#requirements)
-   - [Installation](#installation)
-   - [Launch](#launch)
-3. [Features](#features)
-4. [Cross-Platform Support](#cross-platform-support)
-5. [Usage Walkthrough](#usage-walkthrough)
-6. [SnippetSense](#snippetsense)
-7. [Testing & Verification](#testing--verification)
-8. [Troubleshooting](#troubleshooting)
-9. [Contributing](#contributing)
-10. [License](#license)
+- [EspansoGUI](#espansogui)
+  - [Table of Contents](#table-of-contents)
+  - [Overview](#overview)
+  - [Getting Started](#getting-started)
+    - [Requirements](#requirements)
+    - [Installation](#installation)
+    - [Launch](#launch)
+  - [Features](#features)
+    - [Core Control](#core-control)
+    - [Snippet \& Variable IDE](#snippet--variable-ide)
+    - [Forms \& Regex](#forms--regex)
+    - [App-Specific Configs](#app-specific-configs)
+    - [CLI \& Utilities](#cli--utilities)
+    - [UI/UX Enhancements](#uiux-enhancements)
+  - [Cross-Platform Support](#cross-platform-support)
+  - [Usage Walkthrough](#usage-walkthrough)
+    - [Dashboard \& Diagnostics](#dashboard--diagnostics)
+    - [YAML Editor](#yaml-editor)
+    - [Snippet IDE Workflow](#snippet-ide-workflow)
+    - [Snippet Library \& Quick Insert](#snippet-library--quick-insert)
+    - [Variables \& Toolkits](#variables--toolkits)
+    - [Paths \& Storage](#paths--storage)
+    - [Packages, Logs, Backups, Match Testing](#packages-logs-backups-match-testing)
+    - [SnippetSense Panel](#snippetsense-panel)
+    - [Help / Playbook](#help--playbook)
+  - [SnippetSense](#snippetsense)
+  - [Testing \& Verification](#testing--verification)
+  - [Troubleshooting](#troubleshooting)
+  - [License](#license)
 
 ---
 
@@ -157,7 +173,7 @@ python test_gui_apis.py     # Invoke every JS-exposed API method
 python3 -m py_compile espansogui.py snippetsense_engine.py  # Syntax gate
 ```
 
-Record the test output in `context/test-log.md` per the repository workflow.
+Record the test output in `test-log.md` per the repository workflow.
 
 ---
 
@@ -170,14 +186,6 @@ Record the test output in `context/test-log.md` per the repository workflow.
 | SnippetSense errors | Confirm `pynput`/`psutil` are installed. Windows-only app filters require `psutil` and Win32 APIs. |
 | Running inside WSL | EspansoGUI relaunches via the Windows interpreter; ensure Windows Python has dependencies or run within WSLg. |
 | CLI path mismatch | Use **Paths & Explorer → Move YAML Files** to relocate/migrate directories, or clear overrides to revert to auto-detected paths. |
-
----
-
-## Contributing
-1. Read `AGENTS.md` for the shared workflow (context files, changelog blocks, testing requirements).
-2. Create a plan, implement the change, and append a changelog entry to every modified source file.
-3. Run the tests listed above and document outputs in `context/test-log.md`.
-4. Submit pull requests with a focused scope and include screenshots/gifs for UI changes when possible.
 
 ---
 
