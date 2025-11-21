@@ -1,0 +1,36 @@
+{
+  "timestamp": "2025-11-21 09:38:50",
+  "overall_duration_seconds": 156.39118194580078,
+  "all_passed": true,
+  "tests": {
+    "create_1000": {
+      "passed": true,
+      "duration_seconds": 153.6917600631714,
+      "failed_count": 0
+    },
+    "list_1000": {
+      "passed": true,
+      "cold_cache_seconds": 0.11869382858276367,
+      "warm_cache_seconds": 4.291534423828125e-06
+    },
+    "search_1000": {
+      "passed": true,
+      "avg_time_seconds": 8.635520935058593e-05
+    },
+    "backup_1000": {
+      "passed": true,
+      "backup_seconds": 0.0233154296875,
+      "restore_seconds": 0.018288612365722656
+    },
+    "large_file_5000": {
+      "passed": true,
+      "parse_seconds": 0.6436657905578613,
+      "file_size_mb": 0.31843090057373047
+    },
+    "rapid_operations_100": {
+      "passed": true,
+      "duration_seconds": 1.5090081691741943,
+      "errors": 0
+    }
+  }
+}

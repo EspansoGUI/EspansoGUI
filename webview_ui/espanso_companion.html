@@ -5,6 +5,30 @@
     <title>EspansoGUI</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        /* Global scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 5px;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--muted);
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+        ::-webkit-scrollbar-corner {
+            background: transparent;
+        }
+
         :root {
             --bg: #0d1117;
             --surface: #161b22;
@@ -33,6 +57,9 @@
             flex-direction: column;
             padding: 20px 12px;
             gap: 8px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            scrollbar-width: thin;
         }
         .sidebar h1 {
             font-size: 18px;
@@ -72,6 +99,7 @@
             flex-direction: column;
             overflow: hidden;
             background: var(--bg);
+            min-height: 0; /* Enable proper flex shrinking */
         }
         .status-bar {
             background: var(--surface);
@@ -94,9 +122,11 @@
         .view {
             display: none;
             flex-direction: column;
-            height: 100%;
+            flex: 1;
+            min-height: 0; /* Critical: enables flex child to shrink below content size */
             padding: 20px;
             overflow-y: auto;
+            overflow-x: hidden;
             gap: 16px;
         }
         .view.active { display: flex; }
@@ -150,6 +180,8 @@
             display: flex;
             flex-direction: column;
             min-height: 0;
+            max-height: 400px; /* Prevent unbounded growth */
+            overflow: hidden;
         }
         .tree-scroll {
             flex: 1;
@@ -250,16 +282,20 @@
             grid-template-columns: 1.4fr 0.6fr;
             gap: 20px;
             min-height: 0;
+            overflow: hidden; /* Prevent grid content from spilling */
         }
         @media (max-width: 1280px) {
             .snippet-ide {
                 grid-template-columns: 1fr;
+                overflow-y: auto; /* Allow scrolling on narrow screens */
             }
         }
         .snippet-editor, .snippet-panels {
             display: flex;
             flex-direction: column;
             gap: 16px;
+            min-height: 0; /* Enable flex shrinking */
+            overflow-y: auto; /* Allow internal scrolling */
         }
         .panel {
             background: var(--surface);
@@ -267,6 +303,22 @@
             border-radius: 8px;
             padding: 16px;
             min-height: 0;
+            overflow: auto; /* Allow scrolling instead of clipping */
+            display: flex;
+            flex-direction: column;
+        }
+        .panel-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+            align-items: start;
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
+        .panel-grid .panel {
+            min-height: 280px;
+            max-height: calc(100vh - 220px);
+            overflow-y: auto;
         }
         .surface-block {
             background: var(--surface-alt);
@@ -342,6 +394,11 @@
             align-items: center;
             margin-bottom: 10px;
         }
+        .helper-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
         .panel-header h3 {
             font-size: 15px;
         }
@@ -406,7 +463,32 @@
             font-weight: 600;
         }
 
-        .snippet-list { max-height: calc(100vh - 400px); min-height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+        .snippet-list {
+            flex: 1;
+            min-height: 200px;
+            max-height: calc(100vh - 320px);
+            overflow-y: auto;
+            overflow-x: hidden;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding-right: 8px; /* Space for scrollbar */
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }
+        .snippet-list::-webkit-scrollbar {
+            width: 8px;
+        }
+        .snippet-list::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .snippet-list::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+        .snippet-list::-webkit-scrollbar-thumb:hover {
+            background: var(--muted);
+        }
         .snippet-card {
             border: 1px solid #30363d;
             border-radius: 6px;
@@ -488,11 +570,128 @@
             border-radius: 6px;
             padding: 12px;
             min-height: 120px;
+            max-height: 300px;
             font-family: 'Consolas', monospace;
             font-size: 12px;
             color: var(--text);
             white-space: pre-wrap;
             overflow-y: auto;
+            scrollbar-width: thin;
+        }
+        .dashboard-section {
+            margin-bottom: 20px;
+        }
+        .dashboard-section h3 {
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: var(--muted);
+        }
+
+        /* Package list styling */
+        .package-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: calc(100vh - 300px);
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+        .package-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        .package-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .package-name {
+            font-weight: 600;
+            color: var(--accent);
+            margin-bottom: 4px;
+        }
+        .package-description {
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .package-actions {
+            display: flex;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+
+        /* Log viewer styling */
+        .log-viewer {
+            background: var(--surface-alt);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            max-height: calc(100vh - 280px);
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        /* Filter group styling for library view */
+        .filter-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            padding: 12px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 16px;
+            align-items: center;
+        }
+        .filter-group label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: var(--text);
+        }
+        .filter-group select,
+        .filter-group input[type="text"] {
+            padding: 6px 10px;
+            background: var(--surface-alt);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text);
+            font-size: 13px;
+        }
+        .filter-group input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+
+        /* SnippetSense view improvements */
+        .snippetsense-settings {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .snippetsense-suggestions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 12px;
+            max-height: calc(100vh - 420px);
+            overflow-y: auto;
+            padding-right: 4px;
         }
 
         .snippetsense-toast-container {
@@ -535,7 +734,15 @@
             color: var(--text);
         }
 
-        .variable-list { display: flex; flex-direction: column; gap: 8px; }
+        .variable-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 280px;
+            overflow-y: auto;
+            padding-right: 4px;
+            scrollbar-width: thin;
+        }
         .variable-card {
             border: 1px solid var(--border);
             border-radius: 6px;
@@ -543,6 +750,7 @@
             display: flex;
             justify-content: space-between;
             gap: 10px;
+            flex-shrink: 0;
         }
         .variable-info { font-size: 12px; }
         .variable-name { font-family: monospace; color: #58a6ff; }
@@ -569,6 +777,8 @@
             gap: 16px;
             flex: 1;
             min-height: 0;
+            max-height: calc(100vh - 200px);
+            overflow: hidden;
         }
         .quick-insert-results {
             flex: 2;
@@ -577,6 +787,7 @@
             border-radius: 8px;
             padding: 12px;
             overflow-y: auto;
+            overflow-x: hidden;
             min-height: 0;
         }
         .quick-snippet-card {
@@ -619,6 +830,9 @@
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 10px;
+            max-height: calc(100vh - 400px);
+            overflow-y: auto;
+            padding-right: 4px;
         }
         .variable-type-card {
             border: 1px solid var(--border);
@@ -637,7 +851,16 @@
         }
         .variable-type-card span { font-size: 11px; color: var(--muted); }
 
-        .global-vars-grid { display: flex; flex-direction: column; gap: 8px; }
+        .global-vars-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: calc(100vh - 350px);
+            overflow-y: auto;
+            padding-right: 8px;
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) transparent;
+        }
         .global-var-card {
             border: 1px solid var(--border);
             border-radius: 6px;
@@ -646,6 +869,7 @@
             display: flex;
             justify-content: space-between;
             gap: 10px;
+            flex-shrink: 0;
         }
         .helper-panel {
             border: 1px solid var(--border);
@@ -677,6 +901,7 @@
             gap: 20px;
             flex: 1;
             min-height: 0;
+            overflow: hidden; /* Contain overflow */
         }
         .settings-nav {
             width: 200px;
@@ -701,25 +926,38 @@
         .settings-pane-container {
             flex: 1;
             min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
         }
         .settings-pane {
             display: none;
             flex-direction: column;
             gap: 16px;
             height: 100%;
+            padding-right: 8px;
         }
         .settings-pane.active { display: flex; }
+        .settings-pane > .panel,
+        .settings-pane > div {
+            flex-shrink: 0;
+        }
 
         .help-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
             gap: 12px;
+            overflow-y: auto; /* Allow scrolling for many cards */
+            max-height: calc(100vh - 180px);
         }
         .help-card {
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 14px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-height: 190px;
         }
         .help-card h4 {
             margin-bottom: 6px;
@@ -806,21 +1044,41 @@
         body.light-theme .image-preview { background: var(--surface-alt); border-color: var(--border); color: var(--muted); }
         body.light-theme .image-preview.drop-target { background: #e7f3ff; border-color: #0969da; }
         body.light-theme .quick-snippet-card:hover { background: rgba(9, 105, 218, 0.1); }
+
+        /* High Contrast Mode Support (Windows High Contrast, forced-colors) */
+        @media (prefers-contrast: high), (forced-colors: active) {
+            :root {
+                --bg: Canvas;
+                --surface: Canvas;
+                --surface-alt: Canvas;
+                --border: CanvasText;
+                --text: CanvasText;
+                --muted: GrayText;
+                --accent: LinkText;
+                --code-bg: Canvas;
+            }
+            .btn, .nav-btn { border: 2px solid CanvasText !important; }
+            .nav-btn.active { background: Highlight !important; color: HighlightText !important; }
+            .status-indicator.connected { background: GreenText !important; }
+            .status-indicator.disconnected { background: RedText !important; }
+            input, textarea, select { border: 2px solid CanvasText !important; }
+            .card { border: 2px solid CanvasText !important; }
+        }
     </style>
 </head>
 <body>
-    <div class="sidebar">
+    <div class="sidebar" role="navigation" aria-label="Main navigation">
         <h1>EspansoGUI</h1>
-        <button class="nav-btn active" data-view="dashboard">Dashboard</button>
-        <button class="nav-btn" data-view="editor">YAML Editor</button>
-        <button class="nav-btn" data-view="snippet">Snippet IDE</button>
-        <button class="nav-btn" data-view="snippet-library">Snippet Library</button>
-        <button class="nav-btn" data-view="quick-insert">Quick Insert</button>
-        <button class="nav-btn" data-view="variable-library">Variable Library</button>
-        <button class="nav-btn" data-view="match-testing">Match Testing</button>
-        <button class="nav-btn" data-view="forms-regex">Forms & Regex</button>
-        <button class="nav-btn" data-view="snippetsense">SnippetSense</button>
-        <button class="nav-btn" type="button" id="settings-toggle" aria-expanded="false">Settings & Tools ▸</button>
+        <button class="nav-btn active" data-view="dashboard" title="View dashboard and connection status">Dashboard</button>
+        <button class="nav-btn" data-view="editor" title="Edit base.yml directly">YAML Editor</button>
+        <button class="nav-btn" data-view="snippet" title="Create and edit individual snippets">Snippet IDE</button>
+        <button class="nav-btn" data-view="snippet-library" title="Browse and manage all snippets">Snippet Library</button>
+        <button class="nav-btn" data-view="quick-insert" title="Quick search and copy snippet triggers">Quick Insert</button>
+        <button class="nav-btn" data-view="variable-library" title="View and edit global variables">Variable Library</button>
+        <button class="nav-btn" data-view="match-testing" title="Test how triggers expand">Match Testing</button>
+        <button class="nav-btn" data-view="forms-regex" title="Build forms and test regex patterns">Forms & Regex</button>
+        <button class="nav-btn" data-view="snippetsense" title="AI-powered snippet suggestions">SnippetSense</button>
+        <button class="nav-btn" type="button" id="settings-toggle" aria-expanded="false" title="Settings, packages, logs, and tools">Settings & Tools ▸</button>
         <div class="nav-subgroup" id="settings-subnav">
             <button class="nav-btn sub" data-view="paths">Paths & Explorer</button>
             <button class="nav-btn sub" data-view="logs">Logs</button>
@@ -860,11 +1118,14 @@
             <div style="margin-top: 20px;">
                 <h3 style="margin-bottom: 8px;">Service Controls</h3>
                 <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-                    <button class="btn" id="btn-start" title="Start the Espanso background process">Start Espanso</button>
-                    <button class="btn" id="btn-stop" title="Stop the Espanso background process">Stop Espanso</button>
-                    <button class="btn" id="btn-restart" title="Restart Espanso to apply changes">Restart Espanso</button>
+                    <button class="btn" id="btn-start" title="Start the Espanso background process (if not running)">Start Espanso</button>
+                    <!-- REMOVED: Stop button - Espanso should run as persistent background service -->
+                    <button class="btn" id="btn-restart" title="Restart Espanso to apply config changes">Restart Espanso</button>
                     <button class="btn secondary" id="btn-refresh" title="Reload dashboard metrics">Refresh Data</button>
                 </div>
+                <p style="margin-top: 8px; font-size: 12px; color: var(--muted);">
+                    <strong>Note:</strong> Espanso runs independently as a system service. Closing this GUI will NOT stop Espanso.
+                </p>
             </div>
             <div style="margin-top: 24px;">
                 <h3 style="margin-bottom: 8px;">Connection Steps</h3>
@@ -1403,15 +1664,16 @@
         <div class="view" id="forms-regex-view">
             <h2>Forms & Regex Builder</h2>
 
-            <div class="panel" style="margin-bottom: 16px;">
-                <div class="panel-header">
-                    <h3>Form Builder</h3>
-                </div>
-                <div style="padding: 16px;">
-                    <div class="input-group" style="margin-bottom: 12px;">
-                        <label>Trigger</label>
-                        <input type="text" id="form-trigger" placeholder=":form" class="input-base">
+            <div class="panel-grid">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h3>Form Builder</h3>
                     </div>
+                    <div style="padding: 16px;">
+                        <div class="input-group" style="margin-bottom: 12px;">
+                            <label>Trigger</label>
+                            <input type="text" id="form-trigger" placeholder=":form" class="input-base">
+                        </div>
 
                     <div style="margin-bottom: 12px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
@@ -1427,14 +1689,13 @@
                             <button class="btn" id="btn-create-form-snippet" title="Generate a snippet using the configured form fields">Create Form Snippet</button>
                             <button class="btn secondary" id="btn-clear-form" title="Reset the form builder fields">Clear</button>
                         </div>
+                    </div>
                 </div>
-            </div>
-
-            <div class="panel">
-                <div class="panel-header">
-                    <h3>Regex Tester</h3>
-                </div>
-                <div style="padding: 16px;">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h3>Regex Tester</h3>
+                    </div>
+                    <div style="padding: 16px;">
                     <div class="input-group" style="margin-bottom: 12px;">
                         <label>Regex Pattern</label>
                         <input type="text" id="regex-pattern" placeholder="^[a-z]+$" class="input-base">
@@ -1450,6 +1711,7 @@
 
                     <div id="regex-test-result" class="surface-block scroll-block block-sm" style="margin-top: 16px;">
                         <p style="color: #8b949e; font-size: 13px;">Enter a pattern and test text, then click "Test Regex".</p>
+                    </div>
                     </div>
                 </div>
             </div>
@@ -1782,16 +2044,8 @@
                 showToast('Failed: ' + err.message, true);
             }
         });
-        document.getElementById('btn-stop').addEventListener('click', async () => {
-            if (!isWebview()) return;
-            try {
-                const result = await window.pywebview.api.stop_service();
-                showToast(result.detail || 'Stop issued');
-                setTimeout(loadDashboard, 600);
-            } catch (err) {
-                showToast('Failed: ' + err.message, true);
-            }
-        });
+        // REMOVED: Stop button removed - Espanso should never be stopped from GUI
+        // Users can stop manually with 'espanso stop' CLI command if needed
         document.getElementById('btn-restart').addEventListener('click', async () => {
             if (!isWebview()) return;
             try {
@@ -2671,6 +2925,22 @@
 
         document.getElementById('btn-refresh-backups')?.addEventListener('click', loadBackups);
 
+        function normalizeSnippetSensePhrase(phrase = '') {
+            return (phrase || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        }
+
+        function deduplicateSnippetSenseList(suggestions = []) {
+            const map = new Map();
+            suggestions.forEach(item => {
+                const normalized = item.normalized || normalizeSnippetSensePhrase(item.phrase);
+                const key = item.hash || normalized || item.id;
+                if (!map.has(key)) {
+                    map.set(key, { ...item, normalized });
+                }
+            });
+            return Array.from(map.values());
+        }
+
         function renderSnippetSenseSettings() {
             const statusEl = document.getElementById('snippetsense-status');
             const metaEl = document.getElementById('snippetsense-meta');
@@ -2729,7 +2999,7 @@
         function renderSnippetSenseSuggestions() {
             const container = document.getElementById('snippetsense-suggestions');
             if (!container) return;
-            const suggestions = snippetSenseState.pending || [];
+            const suggestions = deduplicateSnippetSenseList(snippetSenseState.pending || []);
             if (!suggestions.length) {
                 container.innerHTML = '<p style="color: #8b949e; font-size: 13px;">No suggestions yet.</p>';
                 return;
@@ -2834,12 +3104,14 @@
             if (!isWebview()) return;
             try {
                 const response = await window.pywebview.api.list_snippetsense_suggestions();
-                const oldIds = new Set((snippetSenseState.pending || []).map(item => item.id));
-                snippetSenseState.pending = response.pending || [];
+                const uniqueItems = deduplicateSnippetSenseList(response.pending || []);
+                const oldKeys = new Set((snippetSenseState.pending || []).map(item => item.hash || item.normalized || normalizeSnippetSensePhrase(item.phrase) || item.id));
+                snippetSenseState.pending = uniqueItems;
                 renderSnippetSenseSuggestions();
                 manageSnippetSensePolling();
-                (snippetSenseState.pending || []).forEach(suggestion => {
-                    if (!oldIds.has(suggestion.id)) {
+                uniqueItems.forEach(suggestion => {
+                    const key = suggestion.hash || suggestion.normalized || normalizeSnippetSensePhrase(suggestion.phrase) || suggestion.id;
+                    if (!oldKeys.has(key)) {
                         showSnippetSensePrompt(suggestion);
                     }
                 });
@@ -3981,7 +4253,7 @@
         let refreshInterval = null;
         let logRefreshInterval = null;
         let diagnosticRefreshInterval = null;
-        const DASHBOARD_REFRESH_INTERVAL = 5000;
+        const DASHBOARD_REFRESH_INTERVAL = 30000;  // 30s (reduced from 5s to prevent backend spam)
         const LOG_REFRESH_INTERVAL = 15000;
         const DIAGNOSTIC_REFRESH_INTERVAL = 45000;
         const POST_BOOT_REFRESH_DELAY = 800;
@@ -4015,6 +4287,28 @@
                 setTimeout(bootstrap, 1000);
             }
         }
+
+        // Pause polling when tab hidden (save resources + reduce backend load)
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                // Tab hidden: clear intervals
+                if (refreshInterval) clearInterval(refreshInterval);
+                if (logRefreshInterval) clearInterval(logRefreshInterval);
+                if (diagnosticRefreshInterval) clearInterval(diagnosticRefreshInterval);
+                refreshInterval = logRefreshInterval = diagnosticRefreshInterval = null;
+            } else if (bootstrapped && !refreshInterval) {
+                // Tab visible again: restart intervals
+                refreshInterval = setInterval(loadDashboard, DASHBOARD_REFRESH_INTERVAL);
+                logRefreshInterval = setInterval(() => {
+                    loadLogs({silent: true}).catch(err => console.error('Auto log refresh failed', err));
+                }, LOG_REFRESH_INTERVAL);
+                diagnosticRefreshInterval = setInterval(() => {
+                    runDoctorDiagnostics(true).catch(err => console.error('Auto diagnostics failed', err));
+                }, DIAGNOSTIC_REFRESH_INTERVAL);
+                // Immediate refresh when coming back
+                loadDashboard().catch(err => console.error('Resume refresh failed', err));
+            }
+        });
 
         // Theme toggle
         const themeToggleBtn = document.getElementById('theme-toggle');

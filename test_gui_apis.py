@@ -8,7 +8,7 @@ if sys.platform == "win32":
     import os
     os.system("")
 
-from espansogui import EspansoAPI
+from ui.gui_api import GUIApi as EspansoAPI
 
 def test_all_apis():
     """Test all API methods that the GUI calls."""

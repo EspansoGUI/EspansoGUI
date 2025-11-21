@@ -11,8 +11,7 @@ import uuid
 import yaml
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import webview
 
@@ -20,8 +19,7 @@ import platform
 import shlex
 import shutil
 import subprocess
-import tempfile
-import urllib.request
+import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 try:
@@ -30,8 +28,15 @@ except Exception:  # pragma: no cover - optional dependency
     SnippetSenseEngine = None  # type: ignore
     SnippetSenseUnavailable = RuntimeError
 
-from espanso_companion.cli_integration import EspansoCLI
-from espanso_companion.config_loader import ConfigLoader
+from core.backup_manager import BackupManager
+from core.cli_adapter import CLIAdapter
+from core.config_manager import ConfigManager
+from core.path_manager import PathManager
+from core.path_service import PathService
+from core.service_manager import ServiceManager
+from core.snippet_service import SnippetService
+from core.snippet_store import SnippetStore
+from core.variable_manager import VariableManager
 from espanso_companion.config_tree import ConfigTreeBuilder
 from espanso_companion.feature_catalog import FeatureCatalog, CatalogSection
 from espanso_companion.file_watcher import FileWatcher, WatchEvent
@@ -53,10 +58,12 @@ class EspansoAPI:
     """Exposes the backend surface to the JavaScript dashboard."""
 
     def __init__(self) -> None:
-        self.loader = ConfigLoader()
+        self.config_manager = ConfigManager()
+        self.path_manager = PathManager()
         self.yaml_processor = YamlProcessor()
         self.variable_engine = VariableEngine()
-        self.cli = EspansoCLI()
+        self.cli = CLIAdapter()
+        self.service_manager = ServiceManager(self.cli)
         self.platform = PLATFORM
         self._events: deque[Dict[str, Any]] = deque(maxlen=60)
         self._event_lock = threading.Lock()
@@ -64,7 +71,6 @@ class EspansoAPI:
         self._yaml_errors: List[Dict[str, Any]] = []
         self._connection_steps: List[Dict[str, Any]] = []
         self._watcher: Optional[FileWatcher] = None
-        self._connection_thread: Optional[threading.Thread] = None
         self._ready = False  # Track initialization completion
         self._preferences = self._load_preferences()
         self._snippetsense_settings = self._preferences.get("snippetsense", self._default_snippetsense_settings())
@@ -82,13 +88,41 @@ class EspansoAPI:
         )
         self._snippetsense_lock = threading.Lock()
         self._config_override = self._coerce_override(self._preferences.get("configOverride"))
+
+        # Caching infrastructure for performance
+        self._connection_verified = False
+        self._last_connection_check = 0.0
+        self._connection_cache_ttl = 30  # seconds
+        self._cli_status_cache: Optional[Dict[str, Any]] = None
+        self._cli_status_cache_time = 0.0
+        self._cli_status_cache_ttl = 10  # seconds
+        self._reload_debounce_timer: Optional[threading.Timer] = None
+        self.path_service = PathService(
+            loader=self.path_manager,
+            config=self.config_manager,
+            cli=self.cli,
+            yaml_processor=self.yaml_processor,
+        )
         self._initialize_paths(self._config_override)
+        self.snippet_store = SnippetStore(match_dir=self._paths.match)
+        self.snippet_service = SnippetService(self.snippet_store, self.cli)
+        self.backup_manager = BackupManager(self._manual_backup_dir())
+        self.variable_manager = VariableManager(self._paths.match)
         if self._snippetsense_settings.get("enabled"):
             self._start_snippetsense_engine()
+        self._perform_service_handshake()
+        self._ready = True
+        print(f"[INFO] EspansoGUI ready with {len(self._match_cache)} snippets", flush=True)
         atexit.register(self.shutdown)
 
     def shutdown(self) -> None:
-        """Shutdown resources with proper error logging."""
+        """Shutdown GUI resources WITHOUT stopping Espanso service.
+
+        CRITICAL: Espanso runs as an independent background service.
+        The GUI only manages configs - closing the GUI must NOT stop Espanso.
+        """
+        print("[INFO] Shutting down EspansoGUI (Espanso service will remain running)", flush=True)
+
         self._stop_snippetsense_engine()
         watcher = getattr(self, "_watcher", None)
         if not watcher:
@@ -100,8 +134,10 @@ class EspansoAPI:
             # In production, this could be logged to a file
             print(f"Warning: Error stopping file watcher: {exc}", flush=True)
 
+        print("[INFO] GUI shutdown complete. Espanso service still running.", flush=True)
+
     def _capture_event(self, event: WatchEvent) -> None:
-        """Capture filesystem events with error handling."""
+        """Capture filesystem events with error handling and debounced reload."""
         try:
             entry = {
                 "type": event.event_type,
@@ -110,44 +146,30 @@ class EspansoAPI:
             }
             with self._event_lock:
                 self._events.appendleft(entry)
+
+            # Debounce reload to avoid mid-typing config changes
+            if self._reload_debounce_timer:
+                self._reload_debounce_timer.cancel()
+            self._reload_debounce_timer = threading.Timer(2.0, self._delayed_refresh)
+            self._reload_debounce_timer.start()
         except Exception:
             # Silently ignore errors to prevent watcher thread crash
             # This protects against invalid paths, race conditions, etc.
             pass
 
+    def _delayed_refresh(self) -> None:
+        """Execute debounced refresh after file changes settle."""
+        try:
+            self._populate_matches()
+        except Exception:
+            pass
+
     def _initialize_paths(self, override: Optional[Path]) -> None:
-        self._paths = self.loader.discover_paths(override)
+        self.path_service.initialize(override)
+        self._paths = self.path_service.paths
         print(f"[INFO] Config: {self._paths.config}, Match: {self._paths.match}", flush=True)
-        self._ensure_directories()
-        self._ensure_base_yaml()
-        self._apply_cli_config()
         self._restart_watcher()
         self.refresh_files()
-
-    def _ensure_directories(self) -> None:
-        for path in (self._paths.config, self._paths.match, self._paths.packages, self._paths.runtime):
-            path.mkdir(parents=True, exist_ok=True)
-
-    def _ensure_base_yaml(self) -> None:
-        """Ensure base.yml exists with a minimal default template (never overwrites existing)."""
-        base_file = self._paths.match / "base.yml"
-        if base_file.exists():
-            return
-
-        print(f"[WARNING] base.yml not found, creating default template at {base_file}", flush=True)
-        default_content = """# Espanso match file
-# Learn more at: https://espanso.org/docs/
-
-matches:
-  - trigger: ":hello"
-    replace: "Hello from Espanso!"
-"""
-        try:
-            base_file.write_text(default_content, encoding="utf-8")
-            print(f"[INFO] Created default base.yml", flush=True)
-        except Exception as exc:
-            # Log error but don't fail initialization
-            print(f"[ERROR] Could not create base.yml: {exc}", flush=True)
 
     def _start_snippetsense_engine(self) -> None:
         if not self._snippetsense_available or not SnippetSenseEngine:
@@ -182,16 +204,21 @@ matches:
             return
         if suggestion_hash in (self._snippetsense_settings.get("handled") or []):
             return
+        phrase = payload.get("phrase", "")
+        normalized_phrase = self._normalize_snippetsense_phrase(phrase)
         suggestion = {
             "id": uuid.uuid4().hex,
             "hash": suggestion_hash,
-            "phrase": payload.get("phrase", ""),
+            "phrase": phrase,
+            "normalized": normalized_phrase,
             "count": payload.get("count", 0),
             "created": payload.get("timestamp") or datetime.utcnow().isoformat(),
         }
         with self._snippetsense_lock:
-            hashes = {item.get("hash") for item in self._snippetsense_pending}
-            if suggestion_hash and suggestion_hash in hashes:
+            seen_keys = {(item.get("hash"), item.get("normalized")) for item in self._snippetsense_pending}
+            normalized_set = {item.get("normalized") for item in self._snippetsense_pending if item.get("normalized")}
+            key = (suggestion_hash, normalized_phrase)
+            if key in seen_keys or (normalized_phrase and normalized_phrase in normalized_set):
                 return
             self._snippetsense_pending.append(suggestion)
             if len(self._snippetsense_pending) > 50:
@@ -214,6 +241,11 @@ matches:
             suffix += 1
         return candidate
 
+    @staticmethod
+    def _normalize_snippetsense_phrase(phrase: str) -> str:
+        cleaned = (phrase or "").strip().lower()
+        return re.sub(r"\s+", " ", cleaned)
+
     def _restart_watcher(self) -> None:
         if self._watcher is not None:
             try:
@@ -223,12 +255,6 @@ matches:
         self._watcher = FileWatcher([self._paths.match, self._paths.config])
         self._watcher.register_callback(self._capture_event)
         self._watcher.start()
-
-    def _apply_cli_config(self) -> None:
-        try:
-            self.cli.set_config_dir(self._paths.config)
-        except Exception:
-            pass
 
     @staticmethod
     def _interpret_filter_bool(value: Any) -> bool:
@@ -425,35 +451,6 @@ matches:
             else:
                 shutil.copy2(item, target)
 
-    def _sync_override_to_default_paths(self) -> None:
-        """Mirror an override workspace back to the default Espanso paths."""
-        override = self._config_override
-        if not override:
-            return
-        if not self._paths:
-            return
-        try:
-            default_paths = self.loader.discover_paths(None)
-        except Exception as exc:
-            print(f"[WARNING] Unable to determine default Espanso paths: {exc}", flush=True)
-            return
-
-        if (
-            self._paths.config == default_paths.config
-            and self._paths.match == default_paths.match
-        ):
-            return
-
-        try:
-            self._copy_directory_contents(self._paths.config, default_paths.config)
-            self._copy_directory_contents(self._paths.match, default_paths.match)
-            print(
-                "[INFO] Synced override workspace into default Espanso paths",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[WARNING] Failed to mirror override workspace: {exc}", flush=True)
-
     def _populate_matches(self) -> None:
         """Load and parse all match files with error tracking."""
         matches: List[Dict[str, Any]] = []
@@ -518,12 +515,36 @@ matches:
         with self._event_lock:
             return list(self._events)
 
+    def _perform_service_handshake(self) -> None:
+        """Run the service handshake once during startup."""
+        steps: List[Dict[str, Any]] = []
+        for label, (status, detail) in self.service_manager.ensure_service_ready():
+            ts = datetime.now(timezone.utc).isoformat()
+            detail_text = detail or ""
+            entry = {
+                "label": label,
+                "status": status,
+                "detail": detail_text,
+                "timestamp": ts,
+            }
+            steps.append(entry)
+            print(f"[SERVICE HANDSHAKE] {label}: {status} - {detail_text}", flush=True)
+        self._connection_steps = steps
+        self._connection_verified = True
+        self._last_connection_check = time.time()
+
     def _run_connection_sequence(self) -> None:
-        self._ready = False
+        """Run connection diagnostics with TTL caching to prevent spam."""
+        now = time.time()
+
+        # Skip if recently verified (within TTL window)
+        if self._connection_verified and (now - self._last_connection_check) < self._connection_cache_ttl:
+            return
+
         self._connection_steps = []
         steps: List[Tuple[str, Callable[[], Tuple[str, str]]]] = [
-            ("Ensure Espanso CLI", self._ensure_espanso_installed),
-            ("Espanso service running", self._start_espanso_service),
+            ("Ensure Espanso CLI", lambda: self.service_manager.report_cli_status()),
+            ("Espanso service running", lambda: self.service_manager.report_service_status()),
             ("Check Espanso version", self._check_cli_available),
             ("Detect configuration paths", self._verify_paths),
             ("Validate YAML structure", self._validate_yaml),
@@ -531,15 +552,16 @@ matches:
         ]
         for label, action in steps:
             self._record_step(label, action)
-        self._ready = True
-        print(f"[INFO] EspansoGUI ready with {len(self._match_cache)} snippets", flush=True)
 
-    def _schedule_connection_sequence(self) -> None:
-        if self._connection_thread and self._connection_thread.is_alive():
-            return
-        thread = threading.Thread(target=self._run_connection_sequence, daemon=True, name="Espanso Connection Sequence")
-        self._connection_thread = thread
-        thread.start()
+        # Mark as verified if all critical steps passed
+        critical_passed = all(
+            step["status"] in ("success", "warning")
+            for step in self._connection_steps
+            if step["label"] in ("Ensure Espanso CLI", "Espanso service running")
+        )
+        if critical_passed:
+            self._connection_verified = True
+            self._last_connection_check = now
 
     def _record_step(self, label: str, action: Callable[[], Tuple[str, str]]) -> None:
         try:
@@ -562,59 +584,6 @@ matches:
             message = result.stdout.strip() or "Espanso CLI ready"
             return "success", message
         return "error", result.stderr.strip() or result.stdout.strip() or "Espanso CLI missing"
-
-    def _ensure_espanso_installed(self) -> Tuple[str, str]:
-        if shutil.which("espanso"):
-            return "success", "Espanso CLI already present"
-        try:
-            installer = self._install_espanso()
-            return "success", f"Downloaded installer {installer.name}"
-        except Exception as exc:
-            return "error", f"Failed to install: {exc}"
-
-    def _install_espanso(self) -> Path:
-        """Download and install Espanso with proper error reporting."""
-        if platform.system() != "Windows":
-            raise RuntimeError("Auto-install supported only on Windows")
-
-        installer_url = "https://github.com/federico-terzi/espanso/releases/latest/download/espanso-setup.exe"
-        target = Path(tempfile.gettempdir()) / "espanso-setup.exe"
-
-        try:
-            # Download installer with error handling
-            urllib.request.urlretrieve(installer_url, target)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to download Espanso installer: {exc}")
-
-        # Run installer and capture output for diagnostics
-        result = subprocess.run(
-            [str(target), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
-            check=False,  # Don't raise on error - we want to check returncode
-            capture_output=True,  # Capture output instead of suppressing
-            text=True,
-        )
-
-        if result.returncode != 0:
-            error_msg = result.stderr.strip() or result.stdout.strip() or f"Exit code {result.returncode}"
-            raise RuntimeError(f"Espanso installer failed: {error_msg}")
-
-        return target
-
-    def _start_espanso_service(self) -> Tuple[str, str]:
-        """Ensure the Espanso daemon is running without spamming start commands."""
-        status_result = self.cli.run(["status"])
-        status_output = (status_result.stdout or status_result.stderr or "").strip()
-        if status_result.returncode == 0 and "running" in status_output.lower():
-            return "success", status_output or "Espanso already running"
-
-        result = self.cli.run(["start"])
-        if result.returncode == 0:
-            return "success", "Espanso daemon started"
-        detail = result.stdout.strip() or result.stderr.strip()
-        state = detail.lower()
-        if "already running" in state:
-            return "success", detail or "Espanso already running"
-        return "error", detail or "start command failed"
 
     def _verify_paths(self) -> Tuple[str, str]:
         details = ", ".join(
@@ -663,13 +632,23 @@ matches:
         return {"status": status, "detail": detail or f"Command {' '.join(args)} completed"}
 
     def get_dashboard(self) -> Dict[str, Any]:
-        """Get dashboard data with defensive initialization."""
+        """Get dashboard data with defensive initialization and caching."""
         # Only repopulate if cache is empty (don't reload on every call)
         if not self._match_cache:
             self._populate_matches()
 
-        status = self.cli.status()
-        self._schedule_connection_sequence()
+        if self.service_manager.should_skip_status_checks():
+            status = self.service_manager.get_status_snapshot()
+        else:
+            now = time.time()
+            if self._cli_status_cache and (now - self._cli_status_cache_time) < self._cli_status_cache_ttl:
+                status = self._cli_status_cache
+            else:
+                status = self.cli.status()
+                self._cli_status_cache = status
+                self._cli_status_cache_time = now
+
+        self._run_connection_sequence()
 
         # Use cached data with fallbacks
         matches = self._match_cache if self._match_cache else []
@@ -715,76 +694,22 @@ matches:
         }
 
     def get_path_settings(self) -> Dict[str, Any]:
-        env_overrides = {key: str(value) for key, value in self.loader.last_env_paths().items()}
-        cli_detected = {key: str(value) for key, value in self.loader.last_cli_paths().items()}
-        editor_backup = self._editor_backup_dir()
-        manual_backup = self._manual_backup_dir()
-        archive_backup = self._archive_backup_dir()
-        return {
-            "config": str(self._paths.config),
-            "match": str(self._paths.match),
-            "packages": str(self._paths.packages),
-            "runtime": str(self._paths.runtime),
-            "override": str(self._config_override) if self._config_override else "",
-            "envOverrides": env_overrides,
-            "cliDetected": cli_detected,
-            "storageRoot": str(self._data_root()),
-            "storageOverride": str(self._preferences.get("storageRoot") or ""),
-            "editorBackups": str(editor_backup),
-            "manualBackups": str(manual_backup),
-            "archiveBackups": str(archive_backup),
-        }
+        return self.path_service.get_path_settings()
 
     def set_config_override(self, new_path: str) -> Dict[str, Any]:
-        target = self._coerce_override(new_path)
-        if target is None or not target.exists() or not target.is_dir():
-            return {"status": "error", "detail": f"Config directory not found: {new_path}"}
-        self._config_override = target
-        self._preferences["configOverride"] = str(target)
-        self._save_preferences()
-        self._initialize_paths(self._config_override)
-        return {"status": "success", "detail": f"Config directory set to {target}", "paths": self.get_path_settings()}
+        return self.path_service.set_config_override(new_path)
 
     def relocate_config_directory(self, new_path: str, migrate: bool = True) -> Dict[str, Any]:
-        target = self._coerce_override(new_path)
-        if target is None:
-            return {"status": "error", "detail": f"Invalid directory: {new_path}"}
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            if migrate and self._paths and self._paths.config.exists():
-                self._copy_directory_contents(self._paths.config, target)
-        except Exception as exc:
-            return {"status": "error", "detail": f"Failed to prepare target directory: {exc}"}
-        return self.set_config_override(str(target))
+        return self.path_service.relocate_config_directory(new_path, migrate)
 
     def clear_config_override(self) -> Dict[str, Any]:
-        self._config_override = None
-        if "configOverride" in self._preferences:
-            self._preferences.pop("configOverride")
-            self._save_preferences()
-        self._initialize_paths(self._config_override)
-        return {"status": "success", "detail": "Reverted to auto-detected Espanso paths", "paths": self.get_path_settings()}
+        return self.path_service.clear_config_override()
 
     def set_storage_root(self, new_path: str, migrate: bool = True) -> Dict[str, Any]:
-        target = self._coerce_override(new_path)
-        if target is None:
-            return {"status": "error", "detail": f"Invalid directory: {new_path}"}
-        old_root = self._data_root()
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            if migrate and old_root.exists() and old_root != target:
-                self._copy_directory_contents(old_root, target)
-            self._preferences["storageRoot"] = str(target)
-            self._save_preferences()
-            return {"status": "success", "detail": f"Backups will now use {target}", "paths": self.get_path_settings()}
-        except Exception as exc:
-            return {"status": "error", "detail": f"Failed to update backup directory: {exc}"}
+        return self.path_service.set_storage_root(new_path, migrate)
 
     def clear_storage_root(self) -> Dict[str, Any]:
-        if "storageRoot" in self._preferences:
-            self._preferences.pop("storageRoot")
-            self._save_preferences()
-        return {"status": "success", "detail": "Backups now stored in the default profile directory", "paths": self.get_path_settings()}
+        return self.path_service.clear_storage_root()
 
     def get_config_tree(self) -> Dict[str, Any]:
         builder = ConfigTreeBuilder(self._paths.config, self._paths.match, self.yaml_processor)
@@ -852,12 +777,6 @@ matches:
         detail = result.stdout.strip() or result.stderr.strip()
         status = "success" if result.returncode == 0 else "warning"
         return {"status": status, "detail": detail or "Espanso start requested"}
-
-    def stop_service(self) -> Dict[str, str]:
-        result = self.cli.run(["stop"])
-        detail = result.stdout.strip() or result.stderr.strip()
-        status = "success" if result.returncode == 0 else "warning"
-        return {"status": status, "detail": detail or "Espanso stop requested"}
 
     def restart_service(self) -> Dict[str, str]:
         result = self.cli.reload()
@@ -1002,72 +921,33 @@ matches:
 
     def backup_config(self) -> Dict[str, str]:
         """Create manual backup of entire config directory."""
-        try:
-            import shutil
-            from datetime import datetime
-
-            backup_dir = self._manual_backup_dir()
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"config_backup_{timestamp}"
-            backup_path = backup_dir / backup_name
-
-            config_dir = self._paths.config
-            shutil.copytree(config_dir, backup_path)
-
-            return {"status": "success", "detail": f"Backup created: {backup_name}", "path": str(backup_path)}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+        return self.backup_manager.create_manual_backup(self._paths.config)
 
     def restore_config(self, backup_name: str) -> Dict[str, str]:
         """Restore config from backup."""
-        try:
-            import shutil
-
-            backup_dir = self._manual_backup_dir()
-            backup_path = backup_dir / backup_name
-
-            if not backup_path.exists():
-                return {"status": "error", "detail": f"Backup not found: {backup_name}"}
-
-            config_dir = self._paths.config
-            temp_backup = config_dir.parent / f"{config_dir.name}_temp_backup"
-
-            if config_dir.exists():
-                shutil.move(str(config_dir), str(temp_backup))
-
-            try:
-                shutil.copytree(backup_path, config_dir)
-                if temp_backup.exists():
-                    shutil.rmtree(temp_backup)
-                self._match_cache = []
-                self._populate_matches()
-                return {"status": "success", "detail": f"Restored from: {backup_name}"}
-            except Exception as e:
-                if temp_backup.exists():
-                    if config_dir.exists():
-                        shutil.rmtree(config_dir)
-                    shutil.move(str(temp_backup), str(config_dir))
-                raise e
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+        result = self.backup_manager.restore_backup(
+            backup_name, self._paths.config, overwrite=True
+        )
+        if result.get("status") == "success":
+            # Refresh cache after restore
+            self._match_cache = []
+            self._populate_matches()
+        return result
 
     def list_backups(self) -> Dict[str, Any]:
         """List available manual backups."""
         try:
-            backup_dir = self._manual_backup_dir()
-            if not backup_dir.exists():
-                return {"status": "success", "backups": []}
-
-            backups = []
-            for item in sorted(backup_dir.iterdir(), reverse=True):
-                if item.is_dir():
-                    backups.append({
-                        "name": item.name,
-                        "path": str(item),
-                        "created": item.stat().st_mtime
-                    })
-            return {"status": "success", "backups": backups}
+            backups = self.backup_manager.list_backups()
+            # Transform to expected format with created timestamp
+            result = []
+            for b in backups:
+                backup_path = Path(b["path"])
+                result.append({
+                    "name": b["name"],
+                    "path": b["path"],
+                    "created": backup_path.stat().st_mtime if backup_path.exists() else 0
+                })
+            return {"status": "success", "backups": result}
         except Exception as e:
             return {"status": "error", "backups": [], "detail": str(e)}
 
@@ -1112,8 +992,18 @@ matches:
 
     def list_snippetsense_suggestions(self) -> Dict[str, Any]:
         with self._snippetsense_lock:
-            pending = list(self._snippetsense_pending)
-        return {"status": "success", "pending": pending}
+            unique = []
+            seen_keys = set()
+            for item in self._snippetsense_pending:
+                key = (item.get("hash"), item.get("normalized"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                unique.append(item)
+            if len(unique) != len(self._snippetsense_pending):
+                self._snippetsense_pending = unique
+                self._save_snippetsense_pending()
+        return {"status": "success", "pending": unique}
 
     def handle_snippetsense_decision(self, suggestion_id: str, decision: str) -> Dict[str, Any]:
         decision = (decision or "").lower()
@@ -1238,105 +1128,21 @@ matches:
         }
         return {"status": "success", "templates": templates}
 
-    def import_snippet_pack(self, file_path: str) -> Dict[str, str]:
-        """Import snippets from JSON/YAML file."""
-        try:
-            import json
-            file_path_obj = Path(file_path)
-            if not file_path_obj.exists():
-                return {"status": "error", "detail": "File not found"}
+    def import_snippet_pack(self, file_path: str) -> Dict[str, Any]:
+        """Delegate snippet pack import to the snippet store."""
+        return self.snippet_store.import_snippet_pack(file_path)
 
-            content = file_path_obj.read_text(encoding="utf-8")
-            if file_path.endswith('.json'):
-                snippets = json.loads(content)
-            else:
-                snippets = yaml.safe_load(content)
-
-            if not isinstance(snippets, list):
-                snippets = snippets.get('matches', [])
-
-            count = 0
-            for snippet in snippets:
-                if 'trigger' in snippet and 'replace' in snippet:
-                    self.create_snippet(snippet)
-                    count += 1
-
-            return {"status": "success", "detail": f"Imported {count} snippets"}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
-
-    def export_snippet_pack(self, triggers: list, file_path: str) -> Dict[str, str]:
-        """Export selected snippets to JSON file."""
-        try:
-            import json
-            snippets = []
-            for trigger in triggers:
-                snippet = self.get_snippet(trigger)
-                if snippet.get('status') == 'success':
-                    snippets.append(snippet.get('snippet', {}))
-
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(snippets, f, indent=2, ensure_ascii=False)
-
-            return {"status": "success", "detail": f"Exported {len(snippets)} snippets"}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+    def export_snippet_pack(self, triggers: list, file_path: str) -> Dict[str, Any]:
+        """Delegate snippet pack export to the snippet store."""
+        return self.snippet_store.export_snippet_pack(triggers, file_path)
 
     def get_global_variables(self) -> Dict[str, Any]:
         """Get all global variables from base config."""
-        try:
-            base_file = self._paths.match / "base.yml"
-            if not base_file.exists():
-                return {"status": "success", "variables": []}
-
-            with open(base_file, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-
-            normalized: List[Dict[str, Any]] = []
-            for raw in data.get('global_vars', []) or []:
-                item = dict(raw or {})
-                var_type = item.get('type') or item.get('var_type') or ''
-                name = item.get('name', '')
-                params = item.get('params') or {}
-                normalized.append({
-                    "name": name,
-                    "type": var_type,
-                    "params": params,
-                })
-            return {"status": "success", "variables": normalized}
-        except Exception as e:
-            return {"status": "error", "variables": [], "detail": str(e)}
+        return self.variable_manager.get_all()
 
     def update_global_variables(self, variables: list) -> Dict[str, str]:
         """Update global variables in base config."""
-        try:
-            base_file = self._paths.match / "base.yml"
-            if not base_file.exists():
-                return {"status": "error", "detail": "base.yml not found"}
-
-            with open(base_file, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-
-            sanitized: List[Dict[str, Any]] = []
-            for item in variables or []:
-                name = (item.get('name') or '').strip()
-                var_type = (item.get('type') or item.get('var_type') or '').strip()
-                if not name or not var_type:
-                    continue
-                entry: Dict[str, Any] = {"name": name, "type": var_type}
-                params = item.get('params') or {}
-                if params:
-                    entry['params'] = params
-                sanitized.append(entry)
-
-            data['global_vars'] = sanitized
-
-            with open(base_file, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-            return {"status": "success", "detail": "Global variables updated"}
-        except Exception as e:
-            return {"status": "error", "detail": str(e)}
+        return self.variable_manager.update_all(variables)
 
     def validate_regex(self, pattern: str) -> Dict[str, Any]:
         """Validate a regex pattern."""
@@ -1490,8 +1296,222 @@ matches:
 
     def refresh_files(self) -> Dict[str, Any]:
         self._populate_matches()
-        self._sync_override_to_default_paths()
-        self._schedule_connection_sequence()
+        return self.get_dashboard()
+
+    def get_base_yaml(self) -> Dict[str, Any]:
+        """Read the base.yaml file for editing."""
+        base_file = self._paths.match / "base.yml"
+        try:
+            if base_file.exists():
+                content = base_file.read_text(encoding="utf-8")
+                return {"status": "success", "content": content, "path": str(base_file)}
+            else:
+                return {"status": "error", "content": "", "detail": "base.yml not found"}
+        except Exception as exc:
+            return {"status": "error", "content": "", "detail": f"Failed to read base.yml: {exc}"}
+
+    def save_base_yaml(self, content: str) -> Dict[str, str]:
+        """Save the base.yaml file after editing."""
+        base_file = self._paths.match / "base.yml"
+        try:
+            # Validate YAML syntax before saving
+            self.yaml_processor.load_str(content)
+
+            # Create backup before saving
+            if base_file.exists():
+                backup_dir = self._editor_backup_dir()
+                backup_file = backup_dir / f"base.yml.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.bak"
+                backup_file.write_text(base_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+            # Save new content
+            base_file.write_text(content, encoding="utf-8")
+
+            # Refresh snippets cache
+            self.refresh_files()
+
+            # Reload espanso to apply changes
+            self.cli.run(["restart"])
+
+            return {"status": "success", "detail": f"Saved and reloaded Espanso"}
+        except Exception as exc:
+            return {"status": "error", "detail": f"Failed to save: {exc}"}
+
+    # ========================================
+    # SNIPPET CRUD OPERATIONS
+    # ========================================
+
+    def _assign_snippet_optional_fields(self, match: Dict[str, Any], snippet_data: Dict[str, Any]) -> None:
+        """Apply optional snippet properties while keeping Espanso schema intact."""
+        bool_fields = ["word", "propagate_case", "left_word", "right_word"]
+        for field in bool_fields:
+            if snippet_data.get(field):
+                match[field] = True
+            else:
+                match.pop(field, None)
+
+        if snippet_data.get("vars"):
+            match["vars"] = snippet_data["vars"]
+        else:
+            match.pop("vars", None)
+
+        if snippet_data.get("form"):
+            match["form"] = snippet_data["form"]
+        else:
+            match.pop("form", None)
+
+        label = (snippet_data.get("label") or "").strip()
+        if label:
+            match["label"] = label
+        else:
+            match.pop("label", None)
+
+        backend = (snippet_data.get("backend") or "").strip().lower()
+        if backend in ["inject", "clipboard"]:
+            match["backend"] = backend.capitalize()
+        else:
+            match.pop("backend", None)
+
+        delay_value = self._sanitize_delay_value(snippet_data.get("delay"))
+        if delay_value is not None:
+            match["delay"] = delay_value
+        else:
+            match.pop("delay", None)
+
+        uppercase_style = (snippet_data.get("uppercase_style") or "").strip()
+        if uppercase_style:
+            match["uppercase_style"] = uppercase_style
+        else:
+            match.pop("uppercase_style", None)
+
+        image_path = (snippet_data.get("image_path") or "").strip()
+        if image_path:
+            match["image_path"] = image_path
+        else:
+            match.pop("image_path", None)
+
+        enabled = snippet_data.get("enabled")
+        if enabled is False:
+            match["enabled"] = False
+        else:
+            match.pop("enabled", None)
+
+    def create_snippet(self, snippet_data: Dict[str, Any]) -> Dict[str, Any]:
+        return self.snippet_service.create_snippet(snippet_data)
+
+    def update_snippet(self, original_trigger: str, snippet_data: Dict[str, Any]) -> Dict[str, Any]:
+        return self.snippet_service.update_snippet(original_trigger, snippet_data)
+
+    def delete_snippet(self, trigger: str) -> Dict[str, Any]:
+        return self.snippet_service.delete_snippet(trigger)
+
+    def create_form_snippet(self, trigger: str, form_fields: list) -> Dict[str, str]:
+        """Create a snippet with form fields."""
+        try:
+            if not trigger:
+                return {"status": "error", "detail": "Trigger is required"}
+
+            replacement_parts = []
+            form_def = []
+
+            for i, field in enumerate(form_fields):
+                field_name = field.get('name', f'field{i}') or f'field{i}'
+                field_type = field.get('type', 'text')
+                normalized_type = field_type
+                if field_type == 'radio':
+                    normalized_type = 'choice'
+                elif field_type == 'select':
+                    normalized_type = 'list'
+
+                field_obj = {'name': field_name, 'type': normalized_type}
+                values = [str(v) for v in field.get('values') or [] if str(v).strip()]
+                if normalized_type in {'choice', 'list'}:
+                    if not values:
+                        return {"status": "error", "detail": f"{field_name} requires at least one option"}
+                    field_obj['values'] = values
+                if normalized_type == 'checkbox':
+                    field_obj['default'] = bool(field.get('default'))
+                elif normalized_type == 'text' and field.get('default'):
+                    field_obj['default'] = field['default']
+
+                form_def.append(field_obj)
+                replacement_parts.append(f"{{{{{field_name}}}}}")
+
+            replacement = " ".join(replacement_parts)
+
+            snippet = {
+                'trigger': trigger,
+                'form': form_def,
+                'replace': replacement
+            }
+
+            return self.create_snippet(snippet)
+        except Exception as e:
+            return {"status": "error", "detail": str(e)}
+
+    def list_snippets(self) -> List[Dict[str, Any]]:
+        """Return cached snippets, populating if necessary."""
+        if not self._match_cache:
+            self._populate_matches()
+        return self._match_cache if self._match_cache else []
+
+    def _snippet_matches_filters(self, snippet: Dict[str, Any], query: str, filters: Dict[str, Any]) -> bool:
+        file_filter = (filters.get("file") or "").strip().lower()
+        if file_filter and (snippet.get("file") or "").lower() != file_filter:
+            return False
+
+        enabled_filter = (filters.get("enabled") or "").strip().lower()
+        enabled_value = snippet.get("enabled", True)
+        if enabled_filter == "enabled" and enabled_value is False:
+            return False
+        if enabled_filter == "disabled" and not (enabled_value is False):
+            return False
+
+        if self._interpret_filter_bool(filters.get("hasVars")) and not snippet.get("hasVars"):
+            return False
+        if self._interpret_filter_bool(filters.get("hasForm")) and not snippet.get("hasForm"):
+            return False
+
+        label_filter = (filters.get("label") or "").strip().lower()
+        if label_filter and label_filter not in (snippet.get("label") or "").lower():
+            return False
+
+        if query:
+            haystack_parts = [
+                snippet.get("trigger") or "",
+                snippet.get("replace") or "",
+                snippet.get("label") or "",
+                snippet.get("file") or "",
+            ]
+            haystack = " ".join(haystack_parts).lower()
+            if query not in haystack:
+                return False
+
+        return True
+
+    def search_snippets(self, query: str = "", filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Search snippets with optional filters."""
+        try:
+            if not self._match_cache:
+                self._populate_matches()
+            snippets = self._match_cache if self._match_cache else []
+            normalized_query = (query or "").strip().lower()
+            filters = filters or {}
+            results = [
+                snippet
+                for snippet in snippets
+                if self._snippet_matches_filters(snippet, normalized_query, filters)
+            ]
+            return {
+                "status": "success",
+                "results": results,
+                "count": len(results),
+                "total": len(snippets),
+            }
+        except Exception as exc:
+            return {"status": "error", "detail": f"Failed to search snippets: {exc}"}
+
+    def refresh_files(self) -> Dict[str, Any]:
+        self._populate_matches()
         return self.get_dashboard()
 
     def get_base_yaml(self) -> Dict[str, Any]:
@@ -1913,53 +1933,44 @@ matches:
             items.extend(section.items)
         return items
 
-
-def _prepare_gui_environment(script_path: Path) -> bool:
-    """Handle the WSL host handoff before starting the GUI backend."""
-    if not PLATFORM.is_wsl:
-        return True
-    if _launch_windows_host_app(script_path):
-        print("[INFO] Detected WSL. Launched EspansoGUI via Windows host process.", flush=True)
-        return False
-    message = (
-        "[ERROR] PyWebView cannot run inside WSL because no GUI subsystem is available, "
-        "and launching the Windows host process failed. Install WSLg or run this script directly on Windows."
-    )
-    print(message, flush=True)
-    raise webview.errors.WebViewException(message)  # type: ignore[attr-defined]
+def _log_gui_attempt(backend: Optional[str]) -> None:
+    label = backend or "auto"
+    print(f"[DEBUG] Attempting to start PyWebView backend '{label}'", flush=True)
 
 
-def _start_webview(window: Any, platform_info: PlatformInfo) -> bool:
+def _start_webview(window: Any, platform_info: PlatformInfo, script_path: Path) -> None:
     last_error: Optional[Exception] = None
-    backend_attempts: List[Optional[str]] = []
-    if platform_info.is_windows:
-        backend_attempts.append("winforms")
-    backend_attempts.extend(platform_info.gui_preferences())
-    # remove duplicates while preserving order
-    seen_backends: Set[Optional[str]] = set()
-    ordered_backends: List[Optional[str]] = []
-    for backend in backend_attempts:
-        if backend in seen_backends:
-            continue
-        seen_backends.add(backend)
-        ordered_backends.append(backend)
+    if platform_info.is_wsl:
+        if _launch_windows_host_app(script_path):
+            print("[INFO] Detected WSL. Launched EspansoGUI via Windows host process.", flush=True)
+            return
+        message = (
+            "[ERROR] PyWebView cannot run inside WSL because no GUI subsystem is available, "
+            "and launching the Windows host process failed. Install WSLg or run this script directly on Windows."
+        )
+        print(message, flush=True)
+        raise webview.errors.WebViewException(message)  # type: ignore[attr-defined]
 
-    for preferred in ordered_backends:
+    print("[DEBUG] Entering PyWebView backend loop", flush=True)
+
+    for preferred in platform_info.gui_preferences():
         try:
+            _log_gui_attempt(preferred)
             webview.start(gui=preferred, debug=True, http_server=False)
-            return True
+            return
         except webview.errors.WebViewException as exc:  # type: ignore[attr-defined]
             last_error = exc
             label = preferred or "auto"
             print(f"[WARNING] GUI backend '{label}' failed: {exc}", flush=True)
+            continue
     print(
         "[ERROR] PyWebView could not initialize a GUI backend. "
         f"{platform_info.gui_dependency_hint()}",
         flush=True,
     )
     if last_error:
-        print(f"[DEBUG] Last GUI error: {last_error}", flush=True)
-    return False
+        raise last_error
+    raise webview.errors.WebViewException("No GUI backend available")  # type: ignore[attr-defined]
 
 
 def _launch_windows_host_app(script_path: Path) -> bool:
@@ -2000,12 +2011,98 @@ def _wsl_to_windows_path(path: Path) -> Optional[str]:
     return None
 
 
+class ConfigHelpers:
+    """Static utility methods for configuration validation and helpers."""
+
+    @staticmethod
+    def validate_config_size(file_path: Path) -> Dict[str, Any]:
+        """Recommend splitting config files larger than 500 lines."""
+        try:
+            if not file_path.exists():
+                return {"status": "error", "detail": "File not found"}
+
+            line_count = len(file_path.read_text(encoding="utf-8").splitlines())
+
+            if line_count > 500:
+                return {
+                    "status": "warning",
+                    "line_count": line_count,
+                    "recommendation": f"Consider splitting {file_path.name} ({line_count} lines) into multiple files for better organization"
+                }
+            return {"status": "ok", "line_count": line_count}
+        except Exception as exc:
+            return {"status": "error", "detail": str(exc)}
+
+    @staticmethod
+    def get_regex_templates() -> List[Dict[str, str]]:
+        """Return common regex pattern templates."""
+        return [
+            {"name": "Email Address", "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", "example": "user@example.com"},
+            {"name": "URL (HTTP/HTTPS)", "pattern": r"https?://[^\s]+", "example": "https://example.com"},
+            {"name": "Phone (US)", "pattern": r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", "example": "(555) 123-4567"},
+            {"name": "Date (YYYY-MM-DD)", "pattern": r"\d{4}-\d{2}-\d{2}", "example": "2025-11-21"},
+            {"name": "Date (MM/DD/YYYY)", "pattern": r"\d{2}/\d{2}/\d{4}", "example": "11/21/2025"},
+            {"name": "Time (24h)", "pattern": r"\d{2}:\d{2}", "example": "14:30"},
+            {"name": "IP Address (IPv4)", "pattern": r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "example": "192.168.1.1"},
+            {"name": "Credit Card", "pattern": r"\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}", "example": "1234-5678-9012-3456"},
+            {"name": "Hex Color", "pattern": r"#[0-9A-Fa-f]{6}", "example": "#FF5733"},
+            {"name": "Username (alphanumeric)", "pattern": r"^[a-zA-Z0-9_]{3,16}$", "example": "user_123"},
+            {"name": "UUID", "pattern": r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "example": "550e8400-e29b-41d4-a716-446655440000"},
+            {"name": "Markdown Link", "pattern": r"\[([^\]]+)\]\(([^\)]+)\)", "example": "[text](url)"},
+        ]
+
+    @staticmethod
+    def suggest_import_fixes(config_dir: Path) -> List[Dict[str, str]]:
+        """Detect missing imported files and suggest fixes."""
+        import_issues = []
+
+        try:
+            config_file = config_dir / "config" / "default.yml"
+            if not config_file.exists():
+                return []
+
+            import yaml
+            with open(config_file, "r", encoding="utf-8") as f:
+                config_data = yaml.safe_load(f) or {}
+
+            # Check imports
+            imports = config_data.get("imports", [])
+            for import_path in imports:
+                # Resolve relative path
+                if import_path.startswith("../"):
+                    full_path = (config_file.parent / import_path).resolve()
+                else:
+                    full_path = config_dir / import_path
+
+                if not full_path.exists():
+                    import_issues.append({
+                        "issue": "missing_file",
+                        "path": import_path,
+                        "full_path": str(full_path),
+                        "fix": f"Create file: {full_path}"
+                    })
+
+            return import_issues
+        except Exception:
+            return []
+
+
 def main() -> None:
-    script_path = Path(__file__).resolve()
-    if not _prepare_gui_environment(script_path):
-        return
+    """Main entry point with system tray support.
+
+    Features:
+    - Cross-platform system tray icon (Windows, Linux, macOS)
+    - Minimize to tray on window close
+    - Restore from tray (click icon or menu)
+    - Espanso status in tray menu
+    """
+    print("[DEBUG] EspansoAPI init starting", flush=True)
     api = EspansoAPI()
+    print("[DEBUG] EspansoAPI init complete", flush=True)
     html_path = Path(__file__).with_name("webview_ui") / "espanso_companion.html"
+    script_path = Path(__file__).resolve()
+
+    # Create the window
     window = webview.create_window(
         "EspansoGUI",
         html=html_path.read_text(encoding="utf-8"),
@@ -2014,9 +2111,95 @@ def main() -> None:
         height=900,
         min_size=(1000, 700),
     )
-    if not _start_webview(window, api.platform):
-        raise webview.errors.WebViewException("No GUI backend available")  # type: ignore[attr-defined]
+
+    # Initialize system tray with callbacks
+    tray = None
+    try:
+        from core.tray_manager import TrayManager, cleanup_tray
+
+        def show_window():
+            """Restore window from tray."""
+            if window:
+                try:
+                    window.show()
+                    window.restore()  # In case it was minimized
+                except Exception as e:
+                    print(f"[WARN] Could not restore window: {e}", flush=True)
+
+        def exit_app():
+            """Exit the application from tray."""
+            cleanup_tray()
+            if window:
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
+
+        tray = TrayManager(on_show=show_window, on_exit=exit_app)
+        if tray.start():
+            print("[INFO] System tray enabled - minimize to tray supported", flush=True)
+            tray.update_tooltip("EspansoGUI - Running")
+        else:
+            print("[INFO] System tray not available - running without tray icon", flush=True)
+            tray = None
+    except ImportError:
+        print("[INFO] System tray dependencies not installed. Run: pip install pystray pillow", flush=True)
+        tray = None
+    except Exception as e:
+        print(f"[WARN] System tray initialization failed: {e}", flush=True)
+        tray = None
+
+    # Register cleanup on exit
+    import atexit
+    if tray:
+        atexit.register(lambda: cleanup_tray() if 'cleanup_tray' in dir() else None)
+
+    print("[DEBUG] Starting PyWebView", flush=True)
+    _start_webview(window, api.platform, script_path)
+
+    # Cleanup tray on exit
+    if tray:
+        try:
+            from core.tray_manager import cleanup_tray
+            cleanup_tray()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     main()
+
+"""
+CHANGELOG
+2025-02-14 Codex
+- Added snippet validation, timezone-aware backups, and fixed global variable harvesting for the Snippet IDE.
+- Enriched variable metadata so the frontend can render descriptive toolkit cards.
+2025-11-14 Codex
+- Added config override persistence, CLI-aware reinitialization, and config tree APIs plus watcher restarts for path explorer support.
+2025-11-15 Codex
+- CRITICAL FIX: Restored user's base.yml from backup after data loss
+- PERFORMANCE FIX: Changed get_dashboard() to only populate cache once instead of on every call
+- Added _ready flag to track initialization state
+- Added _ensure_base_yaml() to create default template only when file is missing (never overwrites)
+- Added informative logging throughout initialization and error paths
+- Improved defensive checks in get_dashboard() and list_snippets()
+2025-11-14 Codex
+- Implemented Phase 5 snippet metadata CRUD (label, enable/disable, backend, delay, boundaries, uppercase, image) plus the server-side search API with filters.
+2025-11-17 Codex
+- Added Quick Insert backend helpers: image previews, shell command tester, and date offset preview APIs.
+- Extended form snippet creation to support radio/select/checkbox inputs with validation.
+2025-11-17 Codex
+- Normalized global variable serialization to always emit Espanso's `type` field and drop incomplete entries.
+2025-11-17 Codex
+- Implemented pywebview GUI fallback logic so the app auto-detects supported backends and prints runtime installation tips when unavailable.
+2025-11-17 Codex
+- Added backend ping endpoint plus espanso match exec parsing so the dashboard bootstrap and match testing flows are reliable.
+- Preserved Windows CRLF replacements when saving snippets to prevent truncated multi-line output.
+2025-11-17 Codex
+- Changed service health check to inspect `espanso status` before issuing redundant `start` commands so the daemon logs remain quiet while connected.
+2025-11-21 Codex
+- Introduced `ServiceManager` to centralize Espanso CLI/service readiness checks and run a single install/start handshake before the UI becomes ready.
+- `_run_connection_sequence` now reuses the manager for diagnostics so repeated dashboard refreshes no longer toggle the daemon.
+- Cached the service handshake output so `_run_connection_sequence` only runs once, preventing repeated `espanso status`/`start` calls that were looping the Windows service log.
+- Cached the daemon status result from `ServiceManager` and skip polling `espanso status` when the start handshake recently failed so the GUI no longer spams the service when it is known to be down.
+"""
